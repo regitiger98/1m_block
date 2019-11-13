@@ -7,21 +7,37 @@
 #include <linux/types.h>
 #include <linux/netfilter.h>		/* for NF_ACCEPT */
 #include <errno.h>
+#include <string>
+#include <fstream>
+#include <iostream>
+#include <unordered_set>
 
 #include <libnetfilter_queue/libnetfilter_queue.h>
+
+using namespace std;
 
 #define IP_HDR_PROT	0x09
 #define IP_HDR_TOT_LEN	0x02
 #define TCP_HDR_LEN	0x0C
 #define PROTOCOL_TCP 	0x06
 
-struct Pkt_id
+struct Pkt_info
 {
 	int id;
 	bool chk;
 };
 
-char *host;
+unordered_set<string> block;
+
+void Read_hostfile(char *file){
+	ifstream in(file);
+	string line, host;
+
+	while(getline(in, line)){
+		host = line.substr(line.find(",")+1);
+		block.insert(host);
+	}
+}
 
 void dump(unsigned char* buf, int size) {
 	int i;
@@ -35,7 +51,7 @@ void dump(unsigned char* buf, int size) {
 bool Check_pkt(unsigned char *data)
 {
 	uint32_t ip_hdr_len, ip_pkt_len, tcp_hdr_len, tcp_data_len;
-	unsigned char *tcp_data;
+	string tcp_data, host;
 	
 	ip_hdr_len = ((*(uint8_t*)data) & 0x0F) * 4;
 	ip_pkt_len = ntohs(*(uint16_t*)(data + IP_HDR_TOT_LEN));
@@ -52,38 +68,42 @@ bool Check_pkt(unsigned char *data)
 		printf("no TCP Data\n");
 		return false;
 	}
-	tcp_data = data + ip_hdr_len + tcp_hdr_len;
 	tcp_data_len = ip_pkt_len - ip_hdr_len - tcp_hdr_len;
+	tcp_data = string((const char *)(data + ip_hdr_len + tcp_hdr_len), tcp_data_len);
 
-	if(memcmp(tcp_data, "GET", 3)    &&
-	   memcmp(tcp_data, "POST", 4)   &&
-	   memcmp(tcp_data, "HEAD", 4)   &&
-	   memcmp(tcp_data, "PUT", 3)    &&
-	   memcmp(tcp_data, "DELETE", 6) &&
-	   memcmp(tcp_data, "OPTION", 6))
+	if(tcp_data.substr(0, 3) != "GET" &&
+    	   tcp_data.substr(0, 3) != "PUT" &&
+      	   tcp_data.substr(0, 4) != "POST" &&
+      	   tcp_data.substr(0, 4) != "HEAD" &&
+      	   tcp_data.substr(0, 6) != "DELETE" &&
+     	   tcp_data.substr(0, 6) != "OPTION")
 	{
 		printf("no HTTP method\n");
 		return false;
 	}
 	
-	for(int i = 0; i < tcp_data_len; i++)
+	size_t pos = tcp_data.find("Host: ");
+	if(pos == string::npos)
 	{
-		if(!memcmp(tcp_data + i, "Host: ", 6))
-		{
-			if(!memcmp(tcp_data + i + 6, host, strlen(host)))
-				return true;
-			else
-				return false;
-		}
+		cout << "no \"Host: \" found\n";
+		return false;
 	}
+	
+	host = tcp_data.substr(pos + 6);
+	pos = host.find("\r\n");
+	host = host.substr(0, pos);
+	cout << "HTTP host : " << host << endl;
+
+	if(block.find(host) != block.end())
+		return true;
 
 	return false;		
 }
 
 /* returns packet id */
-struct Pkt_id print_pkt (struct nfq_data *tb)
+struct Pkt_info print_pkt (struct nfq_data *tb)
 {
-	struct Pkt_id ret;
+	struct Pkt_info ret;
 	struct nfqnl_msg_packet_hdr *ph;
 	struct nfqnl_msg_packet_hw *hwph;
 	u_int32_t mark,ifi; 
@@ -141,17 +161,17 @@ struct Pkt_id print_pkt (struct nfq_data *tb)
 static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	      struct nfq_data *nfa, void *data)
 {
-	struct Pkt_id pkt_id = print_pkt(nfa);
+	struct Pkt_info pkt_info = print_pkt(nfa);
 	printf("entering callback\n");
-	if(pkt_id.chk == true)
+	if(pkt_info.chk == true)
 	{
 		printf("Packet Droped\n");
-		return nfq_set_verdict(qh, pkt_id.id, NF_DROP, 0, NULL);
+		return nfq_set_verdict(qh, pkt_info.id, NF_DROP, 0, NULL);
 	}
 	else
 	{
 		printf("Packet Accepted\n");
-		return nfq_set_verdict(qh, pkt_id.id, NF_ACCEPT, 0, NULL);
+		return nfq_set_verdict(qh, pkt_info.id, NF_ACCEPT, 0, NULL);
 	}
 }
 
@@ -163,7 +183,6 @@ int main(int argc, char **argv)
 	int fd;
 	int rv;
 	char buf[4096] __attribute__ ((aligned));
-	host = argv[1];
 
 	printf("opening library handle\n");
 	h = nfq_open();
@@ -196,6 +215,8 @@ int main(int argc, char **argv)
 		fprintf(stderr, "can't set packet_copy mode\n");
 		exit(1);
 	}
+
+	Read_hostfile(argv[1]);
 
 	fd = nfq_fd(h);
 
